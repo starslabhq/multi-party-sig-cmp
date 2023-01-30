@@ -130,6 +130,7 @@ func checkRefreshConsistence(t *testing.T, oldConfigs map[party.ID]*config.Confi
 		secretKey := group.NewScalar().Set(lagrange[c.ID]).Mul(c.ECDSA)
 		assert.Contains(t, oldConfigs, c.ID)
 		assert.NotEqual(t, c.ECDSA, oldConfigs[c.ID].ECDSA)
+		assert.Equal(t, c.ChainKey, oldConfigs[c.ID].ChainKey)
 		totalECDSANew.Add(secretKey)
 	}
 
