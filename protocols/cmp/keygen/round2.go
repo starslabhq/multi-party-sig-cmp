@@ -1,6 +1,8 @@
 package keygen
 
 import (
+	"errors"
+
 	"github.com/cronokirby/safenum"
 	"github.com/taurusgroup/multi-party-sig/internal/round"
 	"github.com/taurusgroup/multi-party-sig/internal/types"
@@ -86,12 +88,17 @@ func (round2) StoreMessage(round.Message) error { return nil }
 
 // Finalize implements round.Round
 //
-// - send all committed data.
+// - send all committed data and chainKey commitment.
 func (r *round2) Finalize(out chan<- *round.Message) (round.Session, error) {
+	// commit to chainKey alone for separate opening by encryption
+	SelfChainKeyCommitment, ChainKeyDecommitment, err := r.HashForID(r.SelfID()).Commit(r.ChainKeys[r.SelfID()])
+	if err != nil {
+		return r, errors.New("failed to commit chainKey")
+	}
+
 	// Send the message we created in Round1 to all
-	err := r.BroadcastMessage(out, &broadcast3{
+	err = r.BroadcastMessage(out, &broadcast3{
 		RID:                r.RIDs[r.SelfID()],
-		C:                  r.ChainKeys[r.SelfID()],
 		VSSPolynomial:      r.VSSPolynomials[r.SelfID()],
 		SchnorrCommitments: r.SchnorrRand.Commitment(),
 		ElGamalPublic:      r.ElGamalPublic[r.SelfID()],
@@ -99,13 +106,16 @@ func (r *round2) Finalize(out chan<- *round.Message) (round.Session, error) {
 		S:                  r.S[r.SelfID()],
 		T:                  r.T[r.SelfID()],
 		Decommitment:       r.Decommitment,
+		ChainKeyCommitment: SelfChainKeyCommitment,
 	})
 	if err != nil {
 		return r, err
 	}
 	return &round3{
-		round2:             r,
-		SchnorrCommitments: map[party.ID]*zksch.Commitment{},
+		round2:               r,
+		SchnorrCommitments:   map[party.ID]*zksch.Commitment{},
+		ChainKeyCommitments:  map[party.ID]hash.Commitment{r.SelfID(): SelfChainKeyCommitment},
+		ChainKeyDecommitment: ChainKeyDecommitment,
 	}, nil
 }
 

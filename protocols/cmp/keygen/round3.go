@@ -24,14 +24,15 @@ type round3 struct {
 	*round2
 	// SchnorrCommitments[j] = Aⱼ
 	// Commitment for proof of knowledge in the last round
-	SchnorrCommitments map[party.ID]*zksch.Commitment // Aⱼ
+	SchnorrCommitments   map[party.ID]*zksch.Commitment // Aⱼ
+	ChainKeyCommitments  map[party.ID]hash.Commitment
+	ChainKeyDecommitment hash.Decommitment
 }
 
 type broadcast3 struct {
 	round.NormalBroadcastContent
 	// RID = RIDᵢ
 	RID types.RID
-	C   types.RID
 	// VSSPolynomial = Fᵢ(X) VSSPolynomial
 	VSSPolynomial *polynomial.Exponent
 	// SchnorrCommitments = Aᵢ Schnorr commitment for the final confirmation
@@ -45,6 +46,8 @@ type broadcast3 struct {
 	T *safenum.Nat
 	// Decommitment = uᵢ decommitment bytes
 	Decommitment hash.Decommitment
+	// ChainKeyCommitment = H(chainKeyᵢ)
+	ChainKeyCommitment hash.Commitment
 }
 
 // StoreBroadcastMessage implements round.BroadcastRound.
@@ -56,7 +59,7 @@ type broadcast3 struct {
 // - validate Paillier
 // - validate Pedersen
 // - validate commitments.
-// - store ridⱼ, Cⱼ, Nⱼ, Sⱼ, Tⱼ, Fⱼ(X), Aⱼ.
+// - store ridⱼ, Nⱼ, Sⱼ, Tⱼ, Fⱼ(X), Aⱼ, ChainKeyCommitmentⱼ.
 func (r *round3) StoreBroadcastMessage(msg round.Message) error {
 	from := msg.From
 	body, ok := msg.Content.(*broadcast3)
@@ -72,11 +75,12 @@ func (r *round3) StoreBroadcastMessage(msg round.Message) error {
 	if err := body.RID.Validate(); err != nil {
 		return fmt.Errorf("rid: %w", err)
 	}
-	if err := body.C.Validate(); err != nil {
-		return fmt.Errorf("chainkey: %w", err)
-	}
 	// check decommitment
 	if err := body.Decommitment.Validate(); err != nil {
+		return err
+	}
+	// check ChainKey Commitment
+	if err := body.ChainKeyCommitment.Validate(); err != nil {
 		return err
 	}
 
@@ -103,11 +107,10 @@ func (r *round3) StoreBroadcastMessage(msg round.Message) error {
 	}
 	// Verify decommit
 	if !r.HashForID(from).Decommit(r.Commitments[from], body.Decommitment,
-		body.RID, body.C, VSSPolynomial, body.SchnorrCommitments, body.ElGamalPublic, body.N, body.S, body.T) {
+		body.RID, VSSPolynomial, body.SchnorrCommitments, body.ElGamalPublic, body.N, body.S, body.T) {
 		return errors.New("failed to decommit")
 	}
 	r.RIDs[from] = body.RID
-	r.ChainKeys[from] = body.C
 	r.NModulus[from] = body.N
 	r.S[from] = body.S
 	r.T[from] = body.T
@@ -115,6 +118,7 @@ func (r *round3) StoreBroadcastMessage(msg round.Message) error {
 	r.VSSPolynomials[from] = body.VSSPolynomial
 	r.SchnorrCommitments[from] = body.SchnorrCommitments
 	r.ElGamalPublic[from] = body.ElGamalPublic
+	r.ChainKeyCommitments[from] = body.ChainKeyCommitment
 
 	return nil
 }
@@ -127,7 +131,7 @@ func (round3) StoreMessage(round.Message) error { return nil }
 
 // Finalize implements round.Round
 //
-// - set rid = ⊕ⱼ ridⱼ and update hash state
+// - set rid = ⊕ⱼ ridⱼ
 // - prove Nᵢ is Blum
 // - prove Pedersen parameters
 // - prove Schnorr for all coefficients of fᵢ(X)
@@ -135,14 +139,6 @@ func (round3) StoreMessage(round.Message) error { return nil }
 //
 // - send proofs and encryption of share for Pⱼ.
 func (r *round3) Finalize(out chan<- *round.Message) (round.Session, error) {
-	// c = ⊕ⱼ cⱼ
-	chainKey := r.PreviousChainKey
-	if chainKey == nil {
-		chainKey = types.EmptyRID()
-		for _, j := range r.PartyIDs() {
-			chainKey.XOR(r.ChainKeys[j])
-		}
-	}
 	// RID = ⊕ⱼ RIDⱼ
 	rid := types.EmptyRID()
 	for _, j := range r.PartyIDs() {
@@ -181,21 +177,22 @@ func (r *round3) Finalize(out chan<- *round.Message) (round.Session, error) {
 		share := r.VSSSecret.Evaluate(j.Scalar(r.Group()))
 		// Encrypt share
 		C, _ := r.PaillierPublic[j].Enc(curve.MakeInt(share))
+		// Encrypt chainKey
+		ChainKey, _ := r.PaillierPublic[j].Enc((&safenum.Int{}).SetBytes(r.ChainKeys[r.SelfID()]))
 
 		err := r.SendMessage(out, &message4{
-			Share: C,
+			Share:                C,
+			ChainKey:             ChainKey,
+			ChainKeyDecommitment: r.ChainKeyDecommitment,
 		}, j)
 		if err != nil {
 			return r, err
 		}
 	}
 
-	// Write rid to the hash state
-	r.UpdateHashState(rid)
 	return &round4{
-		round3:   r,
-		RID:      rid,
-		ChainKey: chainKey,
+		round3: r,
+		RID:    rid,
 	}, nil
 }
 

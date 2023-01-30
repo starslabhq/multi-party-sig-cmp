@@ -89,7 +89,7 @@ func (r *round1) Finalize(out chan<- *round.Message) (round.Session, error) {
 
 	// commit to data in message 2
 	SelfCommitment, Decommitment, err := r.HashForID(r.SelfID()).Commit(
-		SelfRID, chainKey, SelfVSSPolynomial, SchnorrRand.Commitment(), ElGamalPublic,
+		SelfRID, SelfVSSPolynomial, SchnorrRand.Commitment(), ElGamalPublic,
 		SelfPedersenPublic.N(), SelfPedersenPublic.S(), SelfPedersenPublic.T())
 	if err != nil {
 		return r, errors.New("failed to commit")

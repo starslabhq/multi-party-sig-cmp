@@ -3,8 +3,10 @@ package keygen
 import (
 	"errors"
 
+	"github.com/taurusgroup/multi-party-sig/internal/params"
 	"github.com/taurusgroup/multi-party-sig/internal/round"
 	"github.com/taurusgroup/multi-party-sig/internal/types"
+	"github.com/taurusgroup/multi-party-sig/pkg/hash"
 	"github.com/taurusgroup/multi-party-sig/pkg/math/curve"
 	"github.com/taurusgroup/multi-party-sig/pkg/math/polynomial"
 	"github.com/taurusgroup/multi-party-sig/pkg/paillier"
@@ -30,6 +32,10 @@ type round4 struct {
 type message4 struct {
 	// Share = Encᵢ(x) is the encryption of the receivers share
 	Share *paillier.Ciphertext
+	// ChainKey = Encᵢ(ChainKey) is the encryption of the receivers ChainKey
+	ChainKey *paillier.Ciphertext
+	// Decommitment of ChainKey
+	ChainKeyDecommitment hash.Decommitment
 }
 
 type broadcast4 struct {
@@ -48,13 +54,17 @@ func (r *round4) StoreBroadcastMessage(msg round.Message) error {
 		return round.ErrInvalidContent
 	}
 
+	// construct hash to verify zk
+	h := r.Hash()
+	_ = h.WriteAny(r.RID, from)
+
 	// verify zkmod
-	if !body.Mod.Verify(zkmod.Public{N: r.NModulus[from]}, r.HashForID(from), r.Pool) {
+	if !body.Mod.Verify(zkmod.Public{N: r.NModulus[from]}, h.Clone(), r.Pool) {
 		return errors.New("failed to validate mod proof")
 	}
 
 	// verify zkprm
-	if !body.Prm.Verify(zkprm.Public{N: r.NModulus[from], S: r.S[from], T: r.T[from]}, r.HashForID(from), r.Pool) {
+	if !body.Prm.Verify(zkprm.Public{N: r.NModulus[from], S: r.S[from], T: r.T[from]}, h.Clone(), r.Pool) {
 		return errors.New("failed to validate prm proof")
 	}
 	return nil
@@ -62,7 +72,7 @@ func (r *round4) StoreBroadcastMessage(msg round.Message) error {
 
 // VerifyMessage implements round.Round.
 //
-// - verify validity of share ciphertext.
+// - verify validity of share ciphertext, ChainKey.
 func (r *round4) VerifyMessage(msg round.Message) error {
 	body, ok := msg.Content.(*message4)
 	if !ok || body == nil {
@@ -70,7 +80,11 @@ func (r *round4) VerifyMessage(msg round.Message) error {
 	}
 
 	if !r.PaillierPublic[msg.To].ValidateCiphertexts(body.Share) {
-		return errors.New("invalid ciphertext")
+		return errors.New("invalid ciphertext of Share")
+	}
+
+	if !r.PaillierPublic[msg.To].ValidateCiphertexts(body.ChainKey) {
+		return errors.New("invalid ciphertext of ChainKey")
 	}
 
 	return nil
@@ -81,7 +95,8 @@ func (r *round4) VerifyMessage(msg round.Message) error {
 // Since this message is only intended for us, we need to do the VSS verification here.
 // - check that the decrypted share did not overflow.
 // - check VSS condition.
-// - save share.
+// - validate chainKey commitments
+// - save share and chainKey.
 func (r *round4) StoreMessage(msg round.Message) error {
 	from, body := msg.From, msg.Content.(*message4)
 
@@ -103,12 +118,34 @@ func (r *round4) StoreMessage(msg round.Message) error {
 		return errors.New("failed to validate VSS share")
 	}
 
+	// decrypt chainkey
+	DecryptedChainKey, err := r.PaillierSecret.Dec(body.ChainKey)
+	if err != nil {
+		return err
+	}
+	ChainKey := types.RID(DecryptedChainKey.Abs().Resize(8 * params.SecBytes).Bytes())
+
+	// check chainKey
+	if err := ChainKey.Validate(); err != nil {
+		return err
+	}
+	// check chainKey decommitment
+	if err := body.ChainKeyDecommitment.Validate(); err != nil {
+		return err
+	}
+	// Verify chainKey decommit
+	if !r.HashForID(from).Decommit(r.ChainKeyCommitments[from], body.ChainKeyDecommitment, ChainKey) {
+		return errors.New("failed to decommit chainKey")
+	}
+
 	r.ShareReceived[from] = Share
+	r.ChainKeys[from] = ChainKey
 	return nil
 }
 
 // Finalize implements round.Round
 //
+// - update hash state for rid
 // - sum of all received shares
 // - compute group public key and individual public keys
 // - recompute config SSID
@@ -116,6 +153,17 @@ func (r *round4) StoreMessage(msg round.Message) error {
 // - write new ssid hash to old hash state
 // - create proof of knowledge of secret.
 func (r *round4) Finalize(out chan<- *round.Message) (round.Session, error) {
+	// Write rid to the hash state
+	r.UpdateHashState(r.RID)
+	// c = ⊕ⱼ cⱼ
+	chainKey := r.PreviousChainKey
+	if chainKey == nil {
+		chainKey = types.EmptyRID()
+		for _, j := range r.PartyIDs() {
+			chainKey.XOR(r.ChainKeys[j])
+		}
+	}
+	r.ChainKey = chainKey
 	// add all shares to our secret
 	UpdatedSecretECDSA := r.Group().NewScalar()
 	if r.PreviousSecretECDSA != nil {
